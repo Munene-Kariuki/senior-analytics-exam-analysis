@@ -1,7 +1,6 @@
 package com.zeraki.assessment.analytics;
 
 import java.util.ArrayList;
-import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -18,6 +17,10 @@ public class ExamAnalysisService {
     private static final Map<Long, Model.ExamReport> CACHE = new HashMap<>();
 
     private final InMemoryRepository repository;
+    private final StudentResultAggregator studentResultAggregator =
+            new StudentResultAggregator(this::gradeFor, this::pointsFor);
+    private final RankAssigner rankAssigner = new RankAssigner();
+    private final StreamSummaryBuilder streamSummaryBuilder = new StreamSummaryBuilder(this::gradeFor);
 
     public ExamAnalysisService(InMemoryRepository repository) {
         this.repository = repository;
@@ -47,109 +50,11 @@ public class ExamAnalysisService {
             if (entries.isEmpty()) {
                 continue;
             }
-
-            List<Model.SubjectResult> subjects = new ArrayList<>();
-            double totalScore = 0;
-            double totalPoints = 0;
-            int counted = 0;
-
-            for (Model.ExamEntry entry : entries) {
-                if (entry.score() == null) {
-                    subjects.add(new Model.SubjectResult(entry.subject(), null, "-", 0));
-                    continue;
-                }
-                String grade = gradeFor(entry.score(), gradingSystem);
-                double points = pointsFor(entry.score(), gradingSystem);
-                subjects.add(new Model.SubjectResult(entry.subject(), entry.score(), grade, points));
-                totalScore = totalScore + entry.score();
-                totalPoints = totalPoints + points;
-                counted = counted + 1;
-            }
-
-            double meanScore = counted == 0 ? 0 : totalScore / counted;
-            double meanPoints = counted == 0 ? 0 : totalPoints / counted;
-            meanScore = Math.round(meanScore * 100.0) / 100.0;
-            meanPoints = Math.round(meanPoints * 100.0) / 100.0;
-
-            String meanGrade = gradeFor((int) Math.round(meanScore), gradingSystem);
-
-            results.add(new Model.StudentResult(
-                    student.id(),
-                    student.admissionNumber(),
-                    student.name(),
-                    student.currentStream(),
-                    subjects,
-                    meanScore,
-                    meanPoints,
-                    meanGrade,
-                    0,
-                    0));
+            results.add(studentResultAggregator.aggregate(student, entries, gradingSystem));
         }
 
-        results.sort(Comparator.comparingDouble(Model.StudentResult::meanScore).reversed());
-
-        List<Model.StudentResult> ranked = new ArrayList<>();
-        for (int i = 0; i < results.size(); i++) {
-            Model.StudentResult r = results.get(i);
-
-            int overall = i + 1;
-            if (i > 0 && results.get(i - 1).meanScore() == r.meanScore()) {
-                overall = ranked.get(i - 1).positionOverall();
-            }
-
-            int inStream = 1;
-            for (Model.StudentResult other : results) {
-                if (other.stream().equals(r.stream()) && other.meanScore() > r.meanScore()) {
-                    inStream = inStream + 1;
-                }
-            }
-
-            ranked.add(new Model.StudentResult(
-                    r.studentId(),
-                    r.admissionNumber(),
-                    r.name(),
-                    r.stream(),
-                    r.subjects(),
-                    r.meanScore(),
-                    r.meanPoints(),
-                    r.meanGrade(),
-                    inStream,
-                    overall));
-        }
-
-        Map<String, List<Model.StudentResult>> byStream = new HashMap<>();
-        for (Model.StudentResult r : ranked) {
-            byStream.computeIfAbsent(r.stream(), k -> new ArrayList<>()).add(r);
-        }
-
-        List<Model.StreamSummary> streams = new ArrayList<>();
-        for (Map.Entry<String, List<Model.StudentResult>> e : byStream.entrySet()) {
-            double sumScore = 0;
-            double sumPoints = 0;
-            for (Model.StudentResult r : e.getValue()) {
-                sumScore = sumScore + r.meanScore();
-                sumPoints = sumPoints + r.meanPoints();
-            }
-            double mean = e.getValue().isEmpty() ? 0 : sumScore / e.getValue().size();
-            double points = e.getValue().isEmpty() ? 0 : sumPoints / e.getValue().size();
-            mean = Math.round(mean * 100.0) / 100.0;
-            points = Math.round(points * 100.0) / 100.0;
-            streams.add(new Model.StreamSummary(
-                    e.getKey(),
-                    e.getValue().size(),
-                    mean,
-                    points,
-                    gradeFor((int) Math.round(mean), gradingSystem),
-                    0));
-        }
-
-        streams.sort(Comparator.comparingDouble(Model.StreamSummary::meanScore).reversed());
-        List<Model.StreamSummary> rankedStreams = new ArrayList<>();
-        for (int i = 0; i < streams.size(); i++) {
-            Model.StreamSummary s = streams.get(i);
-            rankedStreams.add(new Model.StreamSummary(
-                    s.stream(), s.entries(), s.meanScore(), s.meanPoints(), s.meanGrade(), i + 1));
-        }
+        List<Model.StudentResult> ranked = rankAssigner.assignRanks(results);
+        List<Model.StreamSummary> rankedStreams = streamSummaryBuilder.build(ranked, gradingSystem);
 
         double schoolTotal = 0;
         for (Model.StudentResult r : ranked) {
